@@ -1,0 +1,57 @@
+{
+  "pages": [
+    {
+      "path": "pages/login/index",
+      "style": {
+        "navigationBarTitleText": "登录",
+        "navigationStyle": "custom"
+      }
+    },
+    {
+      "path": "pages/home/index",
+      "style": {
+        "navigationBarTitleText": "首页",
+        "navigationStyle": "custom"
+      }
+    },
+    {
+      "path": "pages/excel/index",
+      "style": {
+        "navigationBarTitleText": "表格处理",
+        "navigationStyle": "custom"
+      }
+    },
+    {
+      "path": "pages/accounting/index",
+      "style": {
+        "navigationBarTitleText": "账目核算",
+        "navigationStyle": "custom"
+      }
+    },
+    {
+      "path": "pages/history/index",
+      "style": {
+        "navigationBarTitleText": "历史记录",
+        "navigationStyle": "custom"
+      }
+    },
+    {
+      "path": "pages/index",
+      "style": {
+        "navigationBarTitleText": "",
+        "navigationStyle": "custom"
+      }
+    }
+  ],
+  "globalStyle": {
+    "backgroundColor": "#F5F7FA",
+    "backgroundColorBottom": "#F5F7FA",
+    "backgroundColorTop": "#4CAF50",
+    "backgroundTextStyle": "dark",
+    "navigationBarBackgroundColor": "#4CAF50",
+    "navigationBarTextStyle": "white",
+    "navigationBarTitleText": "智慧表格助手",
+    "navigationStyle": "custom"
+  },
+  "subPackages": []
+}
