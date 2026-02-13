@@ -1,9 +1,9 @@
 <script setup lang="ts">
-import { ref, computed } from 'vue'
+import { ref, computed, onMounted } from 'vue'
 import { useUserStore } from '@/stores/user'
 import { useFilesStore } from '@/stores/files'
 import { http, API } from '@/api'
-import { processExcelFile, downloadBlob } from '@/services/excelProcessor'
+import { processExcelFile, processExcelFileByPath, downloadBlob } from '@/services/excelProcessor'
 import AiAssistant from '@/components/AiAssistant.vue'
 import ExcelPreview from '@/components/ExcelPreview.vue'
 
@@ -14,6 +14,8 @@ const filesStore = useFilesStore()
 const currentStep = ref<'upload' | 'processing' | 'complete'>('upload')
 const isUploading = ref(false)
 const isProcessing = ref(false)
+const isChoosingFile = ref(false)
+const isHarmonyDevice = ref(false)
 
 // 后端超时时间（毫秒）- 超过此时间使用前端处理
 const BACKEND_TIMEOUT = 15000
@@ -34,6 +36,7 @@ const processedFile = ref<{
   fileId?: string
   downloadUrl?: string
   blob?: Blob // 前端处理时保存Blob
+  arrayBuffer?: ArrayBuffer // 移动端本地处理时保存buffer
   previewData?: any[] // 预览数据
 } | null>(null)
 
@@ -64,72 +67,281 @@ function formatFileSize(size: number): string {
   return (size / (1024 * 1024)).toFixed(2) + ' MB'
 }
 
+// 支持的Excel扩展名
+const EXCEL_EXTENSIONS = ['xlsx', 'xls']
+
+// 从路径提取文件名
+function getFileNameFromPath(path = ''): string {
+  if (!path) return ''
+  const normalized = path.replace(/\\/g, '/')
+  const last = normalized.split('/').pop() || ''
+  try {
+    return decodeURIComponent(last)
+  } catch {
+    return last
+  }
+}
+
+// 校验是否为Excel文件
+function isExcelFile(name = '', path = ''): boolean {
+  const target = (name || path).toLowerCase()
+  return EXCEL_EXTENSIONS.some(ext => target.endsWith(`.${ext}`))
+}
+
+// 统一处理已选文件
+function applySelectedFile(file: { name?: string; size?: number; path?: string; raw?: any }) {
+  const path = file.path || ''
+  const name = file.name || getFileNameFromPath(path)
+
+  if (!path || !isExcelFile(name, path)) {
+    uni.showToast({
+      title: '请选择 .xlsx 或 .xls 文件',
+      icon: 'none'
+    })
+    return
+  }
+
+  const raw = file.raw
+  const canUseRawFile = typeof File !== 'undefined' && raw instanceof File
+
+  currentFile.value = {
+    name,
+    size: Number(file.size || 0),
+    path,
+    _file: canUseRawFile ? raw : undefined
+  }
+
+  uni.showToast({
+    title: '文件已选择',
+    icon: 'success'
+  })
+}
+
 // 选择文件
+function extractFilePath(file: any, tempPaths: string[]): string {
+  return file?.path || file?.tempFilePath || file?.filePath || tempPaths[0] || ''
+}
+
+function decodePath(path: string): string {
+  try {
+    return decodeURIComponent(path)
+  } catch {
+    return path
+  }
+}
+
+function normalizeFileName(fileName = ''): string {
+  const cleaned = fileName
+    .replace(/[\\/:*?"<>|]/g, '_')
+    .replace(/\s+/g, ' ')
+    .trim()
+  if (!cleaned) return `excel_${Date.now()}.xlsx`
+  return /\.(xlsx|xls)$/i.test(cleaned) ? cleaned : `${cleaned}.xlsx`
+}
+
+function getErrorMessage(err: any, fallback: string): string {
+  const text = err?.errMsg || err?.message || fallback
+  if (typeof text !== 'string') return fallback
+  return text.length > 34 ? text.slice(0, 34) : text
+}
+
+function getMpFileTypeByName(name = ''): 'xls' | 'xlsx' {
+  return /\.xls$/i.test(name) ? 'xls' : 'xlsx'
+}
+
+function initMpDeviceProfile() {
+  // #ifdef MP-WEIXIN
+  try {
+    const wxRef: any = typeof wx !== 'undefined' ? wx : null
+    const getter = wxRef?.getDeviceInfo
+    const info = typeof getter === 'function' ? getter() : wxRef?.getSystemInfoSync?.()
+    const platformText = `${info?.platform || ''} ${info?.system || ''}`.toLowerCase()
+    isHarmonyDevice.value = platformText.includes('harmony') || platformText.includes('ohos') || platformText.includes('hongmeng')
+  } catch {
+    isHarmonyDevice.value = false
+  }
+  // #endif
+}
+
+async function normalizeSelectedPath(path: string, fileName = ''): Promise<string> {
+  if (!path) return ''
+
+  // #ifdef MP-WEIXIN
+  const fs = uni.getFileSystemManager()
+  const wxRef: any = typeof wx !== 'undefined' ? wx : null
+  const userDataPath = wxRef?.env?.USER_DATA_PATH || ''
+  const extension = (fileName.match(/\.(xlsx|xls)$/i)?.[0] || path.match(/\.(xlsx|xls)$/i)?.[0] || '.xlsx').toLowerCase()
+  const candidates = Array.from(new Set([path, decodePath(path)].filter(Boolean)))
+
+  const canAccess = (target: string) => new Promise<boolean>((resolve) => {
+    fs.access({
+      path: target,
+      success: () => resolve(true),
+      fail: () => resolve(false)
+    })
+  })
+
+  for (const candidate of candidates) {
+    if (await canAccess(candidate)) {
+      return candidate
+    }
+  }
+
+  if (!userDataPath) {
+    return path
+  }
+
+  for (const sourcePath of candidates) {
+    const destPath = `${userDataPath}/excel_src_${Date.now()}_${Math.random().toString(36).slice(2, 8)}${extension}`
+    const copied = await new Promise<boolean>((resolve) => {
+      fs.copyFile({
+        srcPath: sourcePath,
+        destPath,
+        success: () => resolve(true),
+        fail: () => resolve(false)
+      })
+    })
+
+    if (copied && await canAccess(destPath)) {
+      return destPath
+    }
+  }
+  // #endif
+
+  return path
+}
+
+async function chooseBySystemPicker(): Promise<void> {
+  const chooseFile = (uni as any).chooseFile
+  if (typeof chooseFile !== 'function') {
+    throw new Error('当前平台暂不支持文件选择')
+  }
+
+  await new Promise<void>((resolve, reject) => {
+    chooseFile({
+      count: 1,
+      type: 'all',
+      extension: EXCEL_EXTENSIONS,
+      success: async (res: any) => {
+        try {
+          const tempFiles = Array.isArray(res?.tempFiles) ? res.tempFiles : (res?.tempFiles ? [res.tempFiles] : [])
+          const tempPaths = Array.isArray(res?.tempFilePaths) ? res.tempFilePaths : (res?.tempFilePaths ? [res.tempFilePaths] : [])
+          const selected = tempFiles[0] || {}
+          const rawPath = extractFilePath(selected, tempPaths)
+          const fileName = selected.name || selected.fileName || getFileNameFromPath(rawPath)
+          const normalizedPath = await normalizeSelectedPath(rawPath, fileName)
+
+          applySelectedFile({
+            name: fileName,
+            size: selected.size || selected.fileSize,
+            path: normalizedPath,
+            raw: selected
+          })
+          resolve()
+        } catch (err) {
+          reject(err)
+        }
+      },
+      fail: (err: any) => reject(err)
+    })
+  })
+}
+
+async function chooseByWechatMessageFile(): Promise<void> {
+  const chooser = (uni as any).chooseMessageFile || ((typeof wx !== 'undefined' && (wx as any).chooseMessageFile) ? (wx as any).chooseMessageFile : null)
+  if (typeof chooser !== 'function') {
+    throw new Error('当前微信环境不支持从会话选择文件')
+  }
+
+  await new Promise<void>((resolve, reject) => {
+    chooser({
+      count: 1,
+      type: 'file',
+      extension: EXCEL_EXTENSIONS,
+      success: async (res: any) => {
+        const file = res.tempFiles[0] as any
+        if (!file) {
+          reject(new Error('未选择文件'))
+          return
+        }
+
+        try {
+          const tempPaths = Array.isArray((res as any)?.tempFilePaths) ? (res as any).tempFilePaths : ((res as any)?.tempFilePaths ? [(res as any).tempFilePaths] : [])
+          const rawPath = file.path || file.tempFilePath || tempPaths[0] || ''
+          const fileName = file.name || file.fileName || getFileNameFromPath(rawPath)
+          const normalizedPath = await normalizeSelectedPath(rawPath, fileName)
+
+          applySelectedFile({
+            name: fileName,
+            size: file.size || file.fileSize,
+            path: normalizedPath
+          })
+          resolve()
+        } catch (err) {
+          reject(err)
+        }
+      },
+      fail: (err: any) => reject(err)
+    })
+  })
+}
+
 async function handleChooseFile() {
+  if (isProcessing.value || isChoosingFile.value) return
+  isChoosingFile.value = true
+
   try {
     // 微信小程序选择文件
     // #ifdef MP-WEIXIN
-    uni.chooseMessageFile({
-      count: 1,
-      type: 'file',
-      extension: ['xlsx', 'xls'],
-      success: (res) => {
-        const file = res.tempFiles[0]
-        if (file) {
-          currentFile.value = {
-            name: file.name,
-            size: file.size,
-            path: file.path
+    await new Promise<void>((resolve, reject) => {
+      const hasSystemPicker = typeof (uni as any).chooseFile === 'function'
+      const systemTitle = isHarmonyDevice.value ? '从手机文件选择(鸿蒙兼容)' : '从手机文件选择(兼容)'
+      const itemList = hasSystemPicker ? ['从微信会话选择', systemTitle] : ['从微信会话选择']
+      uni.showActionSheet({
+        itemList,
+        success: async (sheetRes) => {
+          try {
+            if (sheetRes.tapIndex === 0 || !hasSystemPicker) {
+              await chooseByWechatMessageFile()
+            } else {
+              await chooseBySystemPicker()
+            }
+            resolve()
+          } catch (error) {
+            reject(error)
           }
-          
-          uni.showToast({
-            title: '文件已选择',
-            icon: 'success'
-          })
-        }
-      },
-      fail: () => {
-        uni.showToast({
-          title: '选择文件失败',
-          icon: 'none'
-        })
-      }
+        },
+        fail: (err) => reject(err)
+      })
     })
     // #endif
     
-    // H5环境模拟选择
-    // #ifdef H5
-    const input = document.createElement('input')
-    input.type = 'file'
-    input.accept = '.xlsx,.xls'
-    input.onchange = (e: any) => {
-      const file = e.target.files[0]
-      if (file) {
-        currentFile.value = {
-          name: file.name,
-          size: file.size,
-          path: URL.createObjectURL(file),
-          _file: file // 保存原始File对象用于前端处理
-        }
-        uni.showToast({
-          title: '文件已选择',
-          icon: 'success'
-        })
-      }
-    }
-    input.click()
+    // App/H5/其他平台选择文件
+    // #ifndef MP-WEIXIN
+    await chooseBySystemPicker()
     // #endif
     
-  } catch (error) {
+  } catch (error: any) {
+    if (error?.errMsg?.includes('cancel')) return
+    // #ifdef MP-WEIXIN
+    try {
+      await chooseBySystemPicker()
+      return
+    } catch {}
+    // #endif
     uni.showToast({
-      title: '选择文件失败，请重试',
+      title: getErrorMessage(error, '选择文件失败，请重试'),
       icon: 'none'
     })
+  } finally {
+    isChoosingFile.value = false
   }
 }
 
 // 开始处理
 async function handleStartProcess() {
+  if (isProcessing.value) return
+
   if (!currentFile.value) {
     uni.showToast({
       title: '请先选择文件',
@@ -164,40 +376,40 @@ async function handleStartProcess() {
   }, 500)
   
   try {
-    // 尝试使用后端处理（带超时）
+    // 移动端优先本地处理，避免网络波动导致失败
+    currentEncouragement.value = '正在上传并提交后端处理...'
     const backendResult = await tryBackendProcess()
-    
-    if (backendResult.success) {
-      // 后端处理成功
-      clearInterval(progressInterval)
-      processProgress.value = 100
-      
-      filesStore.updateFileStatus(recordId, 'completed', new Date().toISOString())
-      
-      const { processedFileId, fileName, downloadUrl } = backendResult.data
-      processedFile.value = {
-        name: fileName || currentFile.value!.name.replace('.xlsx', '_汇总.xlsx'),
-        path: downloadUrl,
-        fileId: processedFileId,
-        downloadUrl
-      }
-      
-      filesStore.addFileRecord({
-        id: processedFileId || 'file_' + Date.now() + '_processed',
-        fileName: processedFile.value.name,
-        fileType: 'processed',
-        filePath: downloadUrl,
-        fileSize: currentFile.value!.size,
-        uploadTime: new Date().toISOString(),
-        processTime: new Date().toISOString(),
-        status: 'completed'
-      })
-      
+      // 尝试使用后端处理（带超时）
+      if (backendResult.success) {
+        // 后端处理成功
+        clearInterval(progressInterval)
+        processProgress.value = 100
+        
+        filesStore.updateFileStatus(recordId, 'completed', new Date().toISOString())
+        
+        const backendData = backendResult.data || {}
+        const processedFileId = backendData.processedFileId || backendData.fileId || backendData.id
+        const processedName = backendData.fileName || backendData.processedFileName || currentFile.value!.name.replace(/\.(xlsx|xls)$/i, '_汇总.xlsx')
+        const backendDownloadUrl = backendData.downloadUrl || backendData.processedFilePath || backendData.filePath || ''
+        processedFile.value = {
+          name: processedName,
+          path: backendDownloadUrl,
+          fileId: processedFileId,
+          downloadUrl: backendDownloadUrl
+        }
+        
+        filesStore.addFileRecord({
+          id: processedFileId || 'file_' + Date.now() + '_processed',
+          fileName: processedFile.value.name,
+          fileType: 'processed',
+          filePath: backendDownloadUrl || `${API.FILE.DOWNLOAD}/${processedFileId || ''}`,
+          fileSize: currentFile.value!.size,
+          uploadTime: new Date().toISOString(),
+          processTime: new Date().toISOString(),
+          status: 'completed'
+        })
     } else {
-      // 后端超时或失败，使用前端处理
-      console.log('后端处理超时，切换到前端处理...')
-      currentEncouragement.value = '正在本地处理您的表格...'
-      
+      currentEncouragement.value = '后端处理失败，正在尝试本地处理...'
       await handleFrontendProcess(recordId)
     }
     
@@ -227,18 +439,34 @@ async function handleStartProcess() {
 }
 
 // 尝试后端处理（带超时）
-async function tryBackendProcess(): Promise<{ success: boolean; data?: any }> {
+async function tryBackendProcess(): Promise<{ success: boolean; data?: any; message?: string }> {
   return new Promise(async (resolve) => {
-    // 设置超时
+    let settled = false
+    const done = (result: { success: boolean; data?: any; message?: string }) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timeoutId)
+      resolve(result)
+    }
+
     const timeoutId = setTimeout(() => {
-      resolve({ success: false })
+      done({ success: false, message: '处理超时，请稍后重试' })
     }, BACKEND_TIMEOUT)
     
     try {
+      if (!currentFile.value?.path) {
+        done({ success: false, message: '未获取到可上传文件路径，改走本地处理' })
+        return
+      }
+
       // 1. 上传文件到后端
       const uploadRes = await http.upload(API.FILE.UPLOAD, currentFile.value!.path, {
+        formData: {
+          fileName: currentFile.value!.name
+        },
         showLoading: false,
-        loadingText: '上传中...'
+        loadingText: '上传中...',
+        timeout: 60000
       })
       
       const fileId = uploadRes.data.fileId
@@ -246,14 +474,12 @@ async function tryBackendProcess(): Promise<{ success: boolean; data?: any }> {
       processProgress.value = 40
       
       // 2. 调用处理接口
-      const processRes = await http.post(API.FILE.PROCESS, { fileId }, { showLoading: false })
+      const processRes = await http.post(API.FILE.PROCESS, { fileId }, { showLoading: false, timeout: 60000 })
       
-      clearTimeout(timeoutId)
-      resolve({ success: true, data: processRes.data })
+      done({ success: true, data: processRes.data })
       
-    } catch (error) {
-      clearTimeout(timeoutId)
-      resolve({ success: false })
+    } catch (error: any) {
+      done({ success: false, message: error?.message || error?.errMsg || '文件上传或处理失败' })
     }
   })
 }
@@ -262,24 +488,21 @@ async function tryBackendProcess(): Promise<{ success: boolean; data?: any }> {
 async function handleFrontendProcess(recordId: string) {
   processedByFrontend.value = true
   
-  // 获取File对象
-  let file: File | null = null
-  
+  const outputName = currentFile.value!.name.replace(/\.(xlsx|xls)$/i, '_会计月汇总.xlsx')
+  let result: any = null
+
   // #ifdef H5
-  file = currentFile.value?._file || null
-  // #endif
-  
-  // #ifdef MP-WEIXIN
-  // 微信小程序需要从临时路径读取
-  // 这里需要特殊处理，暂时使用模拟数据
-  // #endif
-  
-  if (!file) {
-    throw new Error('无法获取文件，请重试')
+  const h5File = currentFile.value?._file || null
+  if (h5File) {
+    result = await processExcelFile(h5File, outputName)
+  } else {
+    result = await processExcelFileByPath(currentFile.value!.path, outputName)
   }
-  
-  // 使用前端Excel处理服务
-  const result = await processExcelFile(file, currentFile.value!.name.replace('.xlsx', '_会计月汇总.xlsx'))
+  // #endif
+
+  // #ifndef H5
+  result = await processExcelFileByPath(currentFile.value!.path, outputName)
+  // #endif
   
   if (!result.success) {
     throw new Error(result.message)
@@ -293,6 +516,7 @@ async function handleFrontendProcess(recordId: string) {
     name: result.fileName!,
     path: '',
     blob: result.blob,
+    arrayBuffer: result.arrayBuffer,
     previewData: result.data
   }
   
@@ -302,7 +526,7 @@ async function handleFrontendProcess(recordId: string) {
     fileName: processedFile.value.name,
     fileType: 'processed',
     filePath: 'local',
-    fileSize: result.blob!.size,
+    fileSize: result.blob?.size || result.arrayBuffer?.byteLength || 0,
     uploadTime: new Date().toISOString(),
     processTime: new Date().toISOString(),
     status: 'completed'
@@ -355,10 +579,46 @@ async function handleDownload() {
   
   try {
     // 前端处理的结果，直接下载Blob
-    if (processedByFrontend.value && processedFile.value.blob) {
+    if (processedByFrontend.value) {
+      // #ifdef H5
+      if (processedFile.value.blob) {
+        uni.hideLoading()
+        downloadBlob(processedFile.value.blob, processedFile.value.name)
+        uni.showToast({ title: '下载已开始', icon: 'success' })
+        return
+      }
+      // #endif
+
+      // #ifdef MP-WEIXIN
+      if (processedFile.value.arrayBuffer) {
+        const fs = uni.getFileSystemManager()
+        const safeFileName = normalizeFileName(processedFile.value.name)
+        const fileType = getMpFileTypeByName(safeFileName)
+        const filePath = `${(wx as any).env.USER_DATA_PATH}/${Date.now()}_${safeFileName}`
+        fs.writeFile({
+          filePath,
+          data: processedFile.value.arrayBuffer,
+          success: () => {
+            uni.hideLoading()
+            uni.openDocument({
+              filePath,
+              fileType,
+              showMenu: true,
+              success: () => uni.showToast({ title: '文件已打开', icon: 'success' }),
+              fail: (err: any) => uni.showToast({ title: getErrorMessage(err, '打开文件失败'), icon: 'none' })
+            })
+          },
+          fail: (err: any) => {
+            uni.hideLoading()
+            uni.showToast({ title: getErrorMessage(err, '保存文件失败'), icon: 'none' })
+          }
+        })
+        return
+      }
+      // #endif
+
       uni.hideLoading()
-      downloadBlob(processedFile.value.blob, processedFile.value.name)
-      uni.showToast({ title: '下载已开始', icon: 'success' })
+      uni.showToast({ title: '请使用预览查看结果', icon: 'none' })
       return
     }
     
@@ -372,21 +632,25 @@ async function handleDownload() {
       success: (res) => {
         uni.hideLoading()
         if (res.statusCode === 200) {
+          const fileType = getMpFileTypeByName(processedFile.value?.name || '')
           uni.openDocument({
             filePath: res.tempFilePath,
+            fileType,
             showMenu: true,
             success: () => {
               uni.showToast({ title: '文件已打开', icon: 'success' })
             },
-            fail: () => {
-              uni.showToast({ title: '打开文件失败', icon: 'none' })
+            fail: (err: any) => {
+              uni.showToast({ title: getErrorMessage(err, '打开文件失败'), icon: 'none' })
             }
           })
+        } else {
+          uni.showToast({ title: `下载失败(${res.statusCode})`, icon: 'none' })
         }
       },
-      fail: () => {
+      fail: (err: any) => {
         uni.hideLoading()
-        uni.showToast({ title: '下载失败', icon: 'none' })
+        uni.showToast({ title: getErrorMessage(err, '下载失败'), icon: 'none' })
       }
     })
     // #endif
@@ -419,6 +683,10 @@ function handleReset() {
 function handleBack() {
   uni.navigateBack()
 }
+
+onMounted(() => {
+  initMpDeviceProfile()
+})
 </script>
 
 <template>
@@ -458,10 +726,10 @@ function handleBack() {
     <view class="main-content">
       <!-- 上传区域 -->
       <view v-if="currentStep === 'upload'" class="upload-section">
-        <view class="upload-card" @click="handleChooseFile">
+        <view class="upload-card" :class="{ picking: isChoosingFile }" @click="handleChooseFile">
           <text class="upload-icon">📤</text>
-          <text class="upload-title">点击选择文件</text>
-          <text class="upload-hint">支持 .xlsx 格式</text>
+          <text class="upload-title">{{ isChoosingFile ? '正在打开选择器...' : '点击选择文件' }}</text>
+          <text class="upload-hint">支持 .xlsx/.xls（App可选手机本机文件）</text>
         </view>
         
         <view v-if="currentFile" class="file-card">
@@ -477,8 +745,30 @@ function handleBack() {
           <text class="tips-title">📋 功能说明</text>
           <text class="tips-text">上传Excel → 按会计月汇总 → 预览下载</text>
         </view>
+
+        <view class="highlights-card">
+          <view class="highlight-item">
+            <text class="highlight-label">端侧处理</text>
+            <text class="highlight-value">小程序/App 后端优先</text>
+          </view>
+          <view class="highlight-item">
+            <text class="highlight-label">支持格式</text>
+            <text class="highlight-value">.xlsx / .xls</text>
+          </view>
+          <view class="highlight-item">
+            <text class="highlight-label">结果能力</text>
+            <text class="highlight-value">预览 + 下载 + 历史记录</text>
+          </view>
+        </view>
+
+        <view class="guide-card">
+          <text class="guide-title">📱 手机端使用提示</text>
+          <text class="guide-text">1. 小程序建议先选“微信会话文件”，失败再选“手机文件”。</text>
+          <text class="guide-text">2. 若网络不稳，系统会自动尝试本地处理。</text>
+          <text class="guide-text">3. 处理失败时优先检查：是否包含“会计月”列。</text>
+        </view>
         
-        <view class="submit-btn" :class="{ disabled: !currentFile }" @click="handleStartProcess">
+        <view class="submit-btn" :class="{ disabled: !currentFile || isProcessing }" @click="handleStartProcess">
           <text>开始处理</text>
         </view>
       </view>
@@ -541,7 +831,7 @@ function handleBack() {
 <style lang="scss" scoped>
 .excel-container {
   height: 100vh;
-  background: linear-gradient(180deg, #F0F4F0 0%, #E8EDE8 50%, #F5F8F5 100%);
+  background: linear-gradient(180deg, #ECF4F8 0%, #E7F0F5 48%, #F7FAFC 100%);
   display: flex;
   flex-direction: column;
   position: relative;
@@ -560,7 +850,7 @@ function handleBack() {
 .glow-1 {
   width: 250rpx;
   height: 250rpx;
-  background: linear-gradient(135deg, #B5D6B2, #9DC49A);
+  background: linear-gradient(135deg, #9CCEE0, #7FB9CF);
   top: 100rpx;
   right: -60rpx;
 }
@@ -568,7 +858,7 @@ function handleBack() {
 .glow-2 {
   width: 200rpx;
   height: 200rpx;
-  background: linear-gradient(135deg, #C5E1C2, #A8D5A2);
+  background: linear-gradient(135deg, #B5D9E8, #8EC5DA);
   bottom: 200rpx;
   left: -50rpx;
   animation-delay: 4s;
@@ -597,7 +887,7 @@ function handleBack() {
     
     .back-icon {
       font-size: 40rpx;
-      color: #5B8C5A;
+      color: #3E6D82;
       font-weight: bold;
     }
   }
@@ -607,7 +897,7 @@ function handleBack() {
     text-align: center;
     font-size: 34rpx;
     font-weight: 600;
-    color: #3D5A3D;
+    color: #2F5667;
   }
   
   .nav-placeholder {
@@ -644,11 +934,11 @@ function handleBack() {
     
     &.active, &.completed {
       .step-dot {
-        background: #5B8C5A;
-        box-shadow: 0 0 12rpx rgba(91, 140, 90, 0.5);
+        background: #3E6D82;
+        box-shadow: 0 0 12rpx rgba(62, 109, 130, 0.45);
       }
       .step-text {
-        color: #5B8C5A;
+        color: #3E6D82;
         font-weight: 600;
       }
     }
@@ -663,7 +953,7 @@ function handleBack() {
     transition: all 0.3s;
     
     &.active {
-      background: #5B8C5A;
+      background: #3E6D82;
     }
   }
 }
@@ -671,6 +961,7 @@ function handleBack() {
 .main-content {
   flex: 1;
   padding: 0 32rpx;
+  padding-bottom: calc(24rpx + env(safe-area-inset-bottom));
   display: flex;
   flex-direction: column;
   position: relative;
@@ -690,7 +981,7 @@ function handleBack() {
     display: flex;
     flex-direction: column;
     align-items: center;
-    border: 3rpx dashed rgba(91, 140, 90, 0.4);
+    border: 3rpx dashed rgba(70, 128, 154, 0.35);
     
     .upload-icon {
       font-size: 56rpx;
@@ -707,6 +998,14 @@ function handleBack() {
       font-size: 24rpx;
       color: #7A9A7A;
       margin-top: 8rpx;
+    }
+
+    &:active {
+      transform: scale(0.99);
+    }
+
+    &.picking {
+      opacity: 0.75;
     }
   }
   
@@ -767,11 +1066,61 @@ function handleBack() {
       color: #6B8A6B;
     }
   }
+
+  .highlights-card {
+    background: rgba(255, 255, 255, 0.86);
+    border-radius: 22rpx;
+    padding: 18rpx 22rpx;
+    display: flex;
+    flex-direction: column;
+    gap: 12rpx;
+    border: 1rpx solid rgba(117, 170, 192, 0.22);
+
+    .highlight-item {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .highlight-label {
+      font-size: 23rpx;
+      color: #5A7F90;
+    }
+
+    .highlight-value {
+      font-size: 23rpx;
+      color: #2F5667;
+      font-weight: 600;
+    }
+  }
+
+  .guide-card {
+    background: rgba(239, 248, 252, 0.92);
+    border-radius: 20rpx;
+    padding: 20rpx 22rpx;
+    border: 1rpx solid rgba(130, 182, 204, 0.28);
+
+    .guide-title {
+      display: block;
+      font-size: 25rpx;
+      color: #2F5667;
+      font-weight: 600;
+      margin-bottom: 8rpx;
+    }
+
+    .guide-text {
+      display: block;
+      font-size: 22rpx;
+      color: #5A7F90;
+      line-height: 1.55;
+      margin-top: 4rpx;
+    }
+  }
   
   .submit-btn {
     margin-top: 20rpx;
     height: 88rpx;
-    background: linear-gradient(135deg, #5B8C5A 0%, #7AA879 100%);
+    background: linear-gradient(135deg, #3E6D82 0%, #5E93AB 100%);
     border-radius: 44rpx;
     display: flex;
     align-items: center;
@@ -786,6 +1135,7 @@ function handleBack() {
     
     &.disabled {
       opacity: 0.5;
+      pointer-events: none;
     }
     
     &:active {

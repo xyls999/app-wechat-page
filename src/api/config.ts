@@ -8,7 +8,7 @@ export const BASE_URL = 'https://wechat-manage.onrender.com'
 
 // DeepSeek AI接口
 export const DEEPSEEK_API_URL = 'https://api.deepseek.com/chat/completions'
-export const DEEPSEEK_API_KEY = 'sk-18c506a09d9e46069b769b46b994ab7b'
+export const DEEPSEEK_API_KEY = 'sk-792891d2f7194ba1a9f6f36ee3084310'
 
 // API 端点 - 注意后端路径为 /api/v1/
 export const API = {

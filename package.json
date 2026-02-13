@@ -6,6 +6,8 @@
   "scripts": {
     "dev": "unh dev",
     "build": "unh build",
+    "build:h5:gh": "unh build && node scripts/fix-gh-pages-h5.cjs",
+    "fix:h5:gh": "node scripts/fix-gh-pages-h5.cjs",
     "about": "unh info",
     "type-check": "vue-tsc --noEmit",
     "lint": "eslint .",

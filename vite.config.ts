@@ -10,6 +10,9 @@ import Uni from '@uni-helper/plugin-uni'
 import UnoCSS from 'unocss/vite'
 
 export default defineConfig({
+  // Use relative asset paths for H5 so deployment under subdirectories
+  // (e.g. /app-wechat-page/) does not produce /assets/* 404.
+  base: './',
   resolve: {
     alias: {
       '@': fileURLToPath(new URL('./src', import.meta.url))
@@ -38,5 +41,3 @@ export default defineConfig({
     ]
   }  
 })
-
-

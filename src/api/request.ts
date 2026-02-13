@@ -18,6 +18,7 @@ interface RequestOptions {
   header?: Record<string, string>
   showLoading?: boolean
   loadingText?: string
+  timeout?: number
 }
 
 interface ApiResponse<T = any> {
@@ -33,7 +34,8 @@ export async function request<T = any>(options: RequestOptions): Promise<ApiResp
     data,
     header = {},
     showLoading = true,
-    loadingText = '加载中...'
+    loadingText = '加载中...',
+    timeout = 30000
   } = options
 
   // 显示加载
@@ -52,6 +54,7 @@ export async function request<T = any>(options: RequestOptions): Promise<ApiResp
           ...getAuthHeader(),
           ...header,
         },
+        timeout,
         success: resolve,
         fail: reject,
       })
@@ -82,8 +85,9 @@ export async function request<T = any>(options: RequestOptions): Promise<ApiResp
       uni.hideLoading()
     }
     
+    const errText = error?.errMsg || error?.message || '网络请求失败'
     uni.showToast({
-      title: error.message || '网络请求失败',
+      title: errText,
       icon: 'none',
     })
     
@@ -99,6 +103,7 @@ interface UploadOptions {
   formData?: Record<string, any>
   showLoading?: boolean
   loadingText?: string
+  timeout?: number
 }
 
 export async function uploadFile<T = any>(options: UploadOptions): Promise<ApiResponse<T>> {
@@ -108,7 +113,8 @@ export async function uploadFile<T = any>(options: UploadOptions): Promise<ApiRe
     name = 'file',
     formData = {},
     showLoading = true,
-    loadingText = '上传中...'
+    loadingText = '上传中...',
+    timeout = 60000
   } = options
 
   if (showLoading) {
@@ -125,6 +131,7 @@ export async function uploadFile<T = any>(options: UploadOptions): Promise<ApiRe
         header: {
           ...getAuthHeader(),
         },
+        timeout,
         success: resolve,
         fail: reject,
       })
@@ -146,8 +153,9 @@ export async function uploadFile<T = any>(options: UploadOptions): Promise<ApiRe
       uni.hideLoading()
     }
     
+    const errText = error?.errMsg || error?.message || '上传失败'
     uni.showToast({
-      title: error.message || '上传失败',
+      title: errText,
       icon: 'none',
     })
     

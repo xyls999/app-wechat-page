@@ -10,22 +10,123 @@ export interface ProcessResult {
   data?: any[]
   fileName?: string
   blob?: Blob
+  arrayBuffer?: ArrayBuffer
 }
 
 /**
  * 读取Excel文件
  */
+function parseExcelFromArrayBuffer(buffer: ArrayBuffer): any[][] {
+  const workbook = XLSX.read(buffer, { type: 'array' })
+  const sheetName = workbook.SheetNames[0]
+  const worksheet = workbook.Sheets[sheetName]
+  return XLSX.utils.sheet_to_json(worksheet, { header: 1 }) as any[][]
+}
+
+function toArrayBuffer(data: any): ArrayBuffer {
+  if (data instanceof ArrayBuffer) {
+    return data
+  }
+
+  if (ArrayBuffer.isView(data)) {
+    const view = data as ArrayBufferView
+    const bytes = new Uint8Array(view.buffer, view.byteOffset, view.byteLength)
+    return bytes.slice().buffer
+  }
+
+  if (typeof data === 'string') {
+    const bytes = new Uint8Array(data.length)
+    for (let i = 0; i < data.length; i++) {
+      bytes[i] = data.charCodeAt(i) & 0xff
+    }
+    return bytes.buffer
+  }
+
+  throw new Error('Excel二进制格式不受支持')
+}
+
+function parseExcelFromReadData(data: any): any[][] {
+  if (data instanceof ArrayBuffer) {
+    return parseExcelFromArrayBuffer(data)
+  }
+
+  if (ArrayBuffer.isView(data)) {
+    const view = data as ArrayBufferView
+    const bytes = new Uint8Array(view.buffer, view.byteOffset, view.byteLength)
+    return parseExcelFromArrayBuffer(bytes.slice().buffer)
+  }
+
+  if (typeof data === 'string') {
+    const workbook = XLSX.read(data, { type: 'binary' })
+    const sheetName = workbook.SheetNames[0]
+    const worksheet = workbook.Sheets[sheetName]
+    return XLSX.utils.sheet_to_json(worksheet, { header: 1 }) as any[][]
+  }
+
+  throw new Error('文件数据格式无效')
+}
+
+function decodePath(path: string): string {
+  try {
+    return decodeURIComponent(path)
+  } catch {
+    return path
+  }
+}
+
+// #ifdef MP-WEIXIN
+async function ensureReadableMpFilePath(filePath: string): Promise<string> {
+  const fs = uni.getFileSystemManager()
+  const wxRef: any = typeof wx !== 'undefined' ? wx : null
+  const userDataPath = wxRef?.env?.USER_DATA_PATH || ''
+  const extension = (filePath.match(/\.(xlsx|xls)$/i)?.[0] || '.xlsx').toLowerCase()
+
+  const candidates = Array.from(new Set([filePath, decodePath(filePath)].filter(Boolean)))
+
+  const canAccess = (path: string) => new Promise<boolean>((resolve) => {
+    fs.access({
+      path,
+      success: () => resolve(true),
+      fail: () => resolve(false)
+    })
+  })
+
+  for (const candidate of candidates) {
+    if (await canAccess(candidate)) {
+      return candidate
+    }
+  }
+
+  if (!userDataPath) {
+    return filePath
+  }
+
+  for (const sourcePath of candidates) {
+    const destPath = `${userDataPath}/excel_in_${Date.now()}_${Math.random().toString(36).slice(2, 8)}${extension}`
+    const copied = await new Promise<boolean>((resolve) => {
+      fs.copyFile({
+        srcPath: sourcePath,
+        destPath,
+        success: () => resolve(true),
+        fail: () => resolve(false)
+      })
+    })
+    if (copied && await canAccess(destPath)) {
+      return destPath
+    }
+  }
+
+  return filePath
+}
+// #endif
+
 export function readExcelFile(file: File): Promise<any[][]> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader()
     reader.onload = (e) => {
       try {
-        const data = e.target?.result
-        const workbook = XLSX.read(data, { type: 'array' })
-        const sheetName = workbook.SheetNames[0]
-        const worksheet = workbook.Sheets[sheetName]
-        const jsonData = XLSX.utils.sheet_to_json(worksheet, { header: 1 })
-        resolve(jsonData as any[][])
+        const data = e.target?.result as ArrayBuffer
+        resolve(parseExcelFromArrayBuffer(data))
       } catch (error) {
         reject(new Error('Excel文件解析失败'))
       }
@@ -33,6 +134,73 @@ export function readExcelFile(file: File): Promise<any[][]> {
     reader.onerror = () => reject(new Error('文件读取失败'))
     reader.readAsArrayBuffer(file)
   })
+}
+
+/**
+ * 从本地路径读取Excel（微信小程序/App）
+ */
+export async function readExcelFileByPath(filePath: string): Promise<any[][]> {
+  if (!filePath) throw new Error('文件路径无效')
+
+  // #ifdef MP-WEIXIN
+  const readablePath = await ensureReadableMpFilePath(filePath)
+  return await new Promise<any[][]>((resolve, reject) => {
+    const fs = uni.getFileSystemManager()
+    fs.readFile({
+      filePath: readablePath,
+      success: (res: any) => {
+        try {
+          resolve(parseExcelFromReadData(res.data))
+        } catch {
+          reject(new Error('Excel解析失败'))
+        }
+      },
+      fail: (err: any) => {
+        const errText = err?.errMsg || '读取文件失败'
+        reject(new Error(`${errText}，请优先从微信会话选择文件`))
+      }
+    })
+  })
+  // #endif
+
+  // #ifdef APP-PLUS
+  return await new Promise<any[][]>((resolve, reject) => {
+    const plusRef: any = (globalThis as any).plus
+    if (!plusRef?.io) {
+      reject(new Error('当前环境不支持本地读取'))
+      return
+    }
+
+    plusRef.io.resolveLocalFileSystemURL(
+      filePath,
+      (entry: any) => {
+        entry.file(
+          (file: any) => {
+            try {
+              const reader = new FileReader()
+              reader.onload = (e: any) => {
+                try {
+                  const buffer = e.target?.result as ArrayBuffer
+                  resolve(parseExcelFromArrayBuffer(buffer))
+                } catch {
+                  reject(new Error('Excel解析失败'))
+                }
+              }
+              reader.onerror = () => reject(new Error('读取文件失败'))
+              reader.readAsArrayBuffer(file)
+            } catch {
+              reject(new Error('读取文件失败'))
+            }
+          },
+          () => reject(new Error('读取文件失败'))
+        )
+      },
+      () => reject(new Error('读取文件失败'))
+    )
+  })
+  // #endif
+
+  throw new Error('当前平台不支持按路径读取文件')
 }
 
 /**
@@ -253,7 +421,7 @@ function generateAllMonths(existingMonths: string[]): string[] {
 /**
  * 将汇总数据导出为Excel文件
  */
-export function exportToExcel(data: any[][], fileName: string = '汇总表格.xlsx'): Blob {
+function buildExcelArrayBuffer(data: any[][]): ArrayBuffer {
   const worksheet = XLSX.utils.aoa_to_sheet(data)
   
   // 设置列宽
@@ -270,8 +438,12 @@ export function exportToExcel(data: any[][], fileName: string = '汇总表格.xl
   
   const workbook = XLSX.utils.book_new()
   XLSX.utils.book_append_sheet(workbook, worksheet, '汇总数据')
-  
-  const excelBuffer = XLSX.write(workbook, { bookType: 'xlsx', type: 'array' })
+  const output = XLSX.write(workbook, { bookType: 'xlsx', type: 'array' })
+  return toArrayBuffer(output)
+}
+
+export function exportToExcel(data: any[][], fileName: string = '汇总表格.xlsx'): Blob {
+  const excelBuffer = buildExcelArrayBuffer(data)
   return new Blob([excelBuffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' })
 }
 
@@ -341,14 +513,55 @@ export async function processExcelFile(
     }
     
     // 3. 生成Excel文件
-    const blob = exportToExcel(result.data!, outputFileName)
+    const arrayBuffer = buildExcelArrayBuffer(result.data!)
+    const blob = new Blob([arrayBuffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' })
     
     return {
       success: true,
       message: '表格处理完成',
       data: result.data,
       fileName: outputFileName,
-      blob
+      blob,
+      arrayBuffer
+    }
+  } catch (error: any) {
+    return {
+      success: false,
+      message: error.message || '处理失败'
+    }
+  }
+}
+
+/**
+ * 通过本地路径处理Excel（微信小程序/App）
+ */
+export async function processExcelFileByPath(
+  filePath: string,
+  outputFileName: string = '会计月汇总表.xlsx'
+): Promise<ProcessResult> {
+  try {
+    const rawData = await readExcelFileByPath(filePath)
+    const result = summarizeByAccountingMonth(rawData)
+
+    if (!result.success) {
+      return result
+    }
+
+    const arrayBuffer = buildExcelArrayBuffer(result.data!)
+    let blob: Blob | undefined
+    try {
+      blob = new Blob([arrayBuffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' })
+    } catch {
+      blob = undefined
+    }
+
+    return {
+      success: true,
+      message: '表格处理完成',
+      data: result.data,
+      fileName: outputFileName,
+      blob,
+      arrayBuffer
     }
   } catch (error: any) {
     return {
